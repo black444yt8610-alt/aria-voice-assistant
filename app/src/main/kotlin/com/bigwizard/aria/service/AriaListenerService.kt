@@ -32,6 +32,7 @@ import com.bigwizard.aria.stt.SttState
 import com.bigwizard.aria.tts.TextToSpeechEngine
 import com.bigwizard.aria.ui.screens.MainActivity
 import com.bigwizard.aria.util.CommandExecutor
+import com.openwakeword.OpenWakeWord
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -86,6 +87,12 @@ class AriaListenerService : Service() {
     private var listenWhenReady = false
     private var isForeground = false
 
+    // Wake detector and Vosk must never capture audio simultaneously.
+    private var wakeWordDetector: OpenWakeWord? = null
+    private var wakeWordTransitionInProgress = false
+    private val wakeWordStopCallbacks = mutableListOf<() -> Unit>()
+    private var listeningRequested = false
+
     // ── Binder ────────────────────────────────────────────────────────────────
 
     private val binder = LocalBinder()
@@ -130,6 +137,13 @@ class AriaListenerService : Service() {
     }
 
     override fun onDestroy() {
+        val detector = wakeWordDetector
+        wakeWordDetector = null
+        if (detector != null) {
+            Thread({
+                runCatching { detector.release() }
+            }, "AriaWakeWordDestroy").apply { isDaemon = true }.start()
+        }
         serviceScope.cancel()
         sttEngine.destroy()
         ttsEngine.destroy()
@@ -184,7 +198,36 @@ class AriaListenerService : Service() {
     private fun observeSettings() {
         val prefs = (application as AriaApplication).preferencesManager
         serviceScope.launch {
-            prefs.appSettingsFlow.collect { settings -> currentSettings = settings }
+            prefs.appSettingsFlow.collect { settings ->
+                val wasEnabled = currentSettings.wakeWordEnabled
+                currentSettings = settings
+
+                if (!wasEnabled && settings.wakeWordEnabled &&
+                    listeningRequested &&
+                    _assistantState.value is AssistantState.Listening
+                ) {
+                    sttEngine.stopListening()
+                    if (wakeWordTransitionInProgress) {
+                        stopWakeWordListening {
+                            if (listeningRequested && currentSettings.wakeWordEnabled) {
+                                startWakeWordListening()
+                            }
+                        }
+                    } else {
+                        startWakeWordListening()
+                    }
+                }
+
+                if (wasEnabled && !settings.wakeWordEnabled &&
+                    (wakeWordDetector != null || wakeWordTransitionInProgress)
+                ) {
+                    stopWakeWordListening {
+                        if (listeningRequested && !currentSettings.wakeWordEnabled) {
+                            startCommandListening()
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -236,6 +279,12 @@ class AriaListenerService : Service() {
                     is SttState.Timeout -> {
                         _partialText.value = ""
                         setState(AssistantState.Idle, getString(R.string.notification_listening_text))
+                        if (listeningRequested && currentSettings.wakeWordEnabled) {
+                            serviceScope.launch {
+                                kotlinx.coroutines.delay(350)
+                                startWakeWordListening()
+                            }
+                        }
                     }
                     is SttState.Error -> {
                         _partialText.value = ""
@@ -263,20 +312,136 @@ class AriaListenerService : Service() {
     // ── Voice Pipeline ────────────────────────────────────────────────────────
 
     fun startListening() {
+        listeningRequested = true
         if (_assistantState.value is AssistantState.Speaking) ttsEngine.stop()
+
+        if (wakeWordTransitionInProgress) {
+            stopWakeWordListening {
+                if (listeningRequested) {
+                    if (currentSettings.wakeWordEnabled) {
+                        startWakeWordListening()
+                    } else {
+                        startCommandListening()
+                    }
+                }
+            }
+            return
+        }
+
+        if (currentSettings.wakeWordEnabled) {
+            startWakeWordListening()
+        } else {
+            startCommandListening()
+        }
+    }
+
+    private fun startCommandListening() {
+        if (!listeningRequested) return
+
         if (!sttEngine.isModelLoaded) {
-            // First run (download) or model unloaded for memory: listen as soon as it's ready.
             listenWhenReady = true
             if (!sttEngine.isLoading) loadSttModel()
             return
         }
+
         ensureForeground()
         _partialText.value = ""
         sttEngine.startListening()
     }
 
-    fun stopListening() {
+    private fun startWakeWordListening() {
+        if (!listeningRequested || !currentSettings.wakeWordEnabled ||
+            wakeWordDetector != null || wakeWordTransitionInProgress
+        ) return
+
+        if (!ensureForeground()) return
+
         listenWhenReady = false
+        sttEngine.stopListening()
+        _partialText.value = ""
+
+        val detector = try {
+            OpenWakeWord.Builder(this)
+                .setModel(OpenWakeWord.BuiltInModel.HEY_JARVIS)
+                .setThreshold(0.55f)
+                .setDebounceMs(2500L)
+                .build()
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not create wake-word detector", e)
+            setState(
+                AssistantState.Error("Wake-word setup failed: ${e.message ?: "unknown error"}"),
+                "Wake-word setup failed"
+            )
+            return
+        }
+
+        wakeWordDetector = detector
+        setState(AssistantState.Listening, "Listening for Hey Jarvis")
+
+        detector.start { score ->
+            if (wakeWordDetector !== detector || wakeWordTransitionInProgress) {
+                return@start
+            }
+
+            Log.i(TAG, "Hey Jarvis detected: score=$score")
+            stopWakeWordListening {
+                if (listeningRequested && currentSettings.wakeWordEnabled) {
+                    setState(
+                        AssistantState.Preparing("Wake word detected — speak now"),
+                        "Wake word detected"
+                    )
+                    startCommandListening()
+                }
+            }
+        }
+    }
+
+    // release() joins the detector's audio thread, so run it off the main thread.
+    // All callbacks wait until the detector has actually released the microphone.
+    private fun stopWakeWordListening(onStopped: (() -> Unit)? = null) {
+        onStopped?.let { wakeWordStopCallbacks.add(it) }
+
+        val detector = wakeWordDetector
+        if (detector == null) {
+            if (!wakeWordTransitionInProgress) {
+                val callbacks = wakeWordStopCallbacks.toList()
+                wakeWordStopCallbacks.clear()
+                callbacks.forEach { callback ->
+                    runCatching { callback() }.onFailure {
+                        Log.e(TAG, "Wake-word stop callback failed", it)
+                    }
+                }
+            }
+            return
+        }
+
+        wakeWordDetector = null
+        wakeWordTransitionInProgress = true
+
+        Thread({
+            try {
+                detector.release()
+            } catch (e: Exception) {
+                Log.w(TAG, "Error stopping wake-word detector", e)
+            }
+
+            serviceScope.launch {
+                wakeWordTransitionInProgress = false
+                val callbacks = wakeWordStopCallbacks.toList()
+                wakeWordStopCallbacks.clear()
+                callbacks.forEach { callback ->
+                    runCatching { callback() }.onFailure {
+                        Log.e(TAG, "Wake-word stop callback failed", it)
+                    }
+                }
+            }
+        }, "AriaWakeWordStop").apply { isDaemon = true }.start()
+    }
+
+    fun stopListening() {
+        listeningRequested = false
+        listenWhenReady = false
+        stopWakeWordListening()
         sttEngine.stopListening()
         _partialText.value = ""
         if (_assistantState.value is AssistantState.Speaking) ttsEngine.stop()
@@ -290,10 +455,12 @@ class AriaListenerService : Service() {
         if (text.isBlank()) return
         if (_assistantState.value is AssistantState.Speaking) ttsEngine.stop()
         sttEngine.stopListening()
+        stopWakeWordListening()
         handleUserText(text)
     }
 
     private fun handleUserText(text: String) {
+        stopWakeWordListening()
         sttEngine.stopListening()
         _partialText.value = ""
         setState(AssistantState.Processing, getString(R.string.state_processing))
@@ -303,7 +470,11 @@ class AriaListenerService : Service() {
             saveMessage(role = "user", content = text)
 
             val reply: String? = when (val command = CommandParser.parse(text)) {
-                is VoiceCommand.StopListening -> getString(R.string.cmd_goodbye)
+                is VoiceCommand.StopListening -> {
+                    listeningRequested = false
+                    listenWhenReady = false
+                    getString(R.string.cmd_goodbye)
+                }
                 is VoiceCommand.PhoneCall -> commandExecutor.makeCall(command.contact)
                 is VoiceCommand.SendSms -> commandExecutor.sendSms(command.contact, command.message)
                 is VoiceCommand.SetAlarm -> commandExecutor.setAlarm(command.time)
@@ -389,7 +560,11 @@ class AriaListenerService : Service() {
                     // Only reset if nothing newer (e.g. the user tapped the mic) took over.
                     if (_assistantState.value === speaking) {
                         setState(AssistantState.Idle, getString(R.string.notification_listening_text))
-                        if (currentSettings.autoListen) startListening()
+                        if (listeningRequested && currentSettings.wakeWordEnabled) {
+                            startWakeWordListening()
+                        } else if (currentSettings.autoListen) {
+                            startListening()
+                        }
                     }
                 }
             }
