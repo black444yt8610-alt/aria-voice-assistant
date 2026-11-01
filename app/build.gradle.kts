@@ -110,6 +110,9 @@ android {
 }
 
 dependencies {
+    // On-device "Hey Jarvis" wake-word detection
+    implementation("com.github.msnilsen:openwakeword-android:0.1.0")
+
     // ── Jetpack Compose BOM ──────────────────────────────────────────────────
     val composeBom = platform("androidx.compose:compose-bom:2024.02.00")
     implementation(composeBom)

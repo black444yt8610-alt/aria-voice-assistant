@@ -344,6 +344,16 @@ fun SettingsScreen(
                     }
                 )
                 SettingsToggle(
+                    title = "Hey Jarvis Wake Word",
+                    subtitle = "Tap the mic to activate, then say Hey Jarvis before your command",
+                    checked = settings.wakeWordEnabled,
+                    onCheckedChange = {
+                        viewModel.saveAppSettings(
+                            settings.copy(wakeWordEnabled = it, wakeWord = "hey jarvis")
+                        )
+                    }
+                )
+                SettingsToggle(
                     title = "Follow-up Listening",
                     subtitle = "Listen again automatically after Aria answers",
                     checked = settings.autoListen,
